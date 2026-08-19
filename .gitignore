@@ -1,0 +1,17 @@
+# Never commit downloaded or extracted upstream course materials.
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+upstream/
+test-work/
+.e2e/
+
+# Vagrant and generated lab state from local validation.
+.vagrant/
+.kube/
+admin.conf
+certs/
+generated-certs/
+kubeadm-init.out
+payload_download_url

@@ -1,0 +1,853 @@
+diff --git a/.gitignore b/.gitignore
+index a925298..6709a90 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,9 @@
++.vagrant/
++.local-artifacts/
++.local-tests/
++.kube/
++admin.conf
++certs/
+ generated-certs/
++kubeadm-init.out
++payload_download_url
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+new file mode 100644
+index 0000000..b567997
+--- /dev/null
++++ b/ARCHITECTURE.md
+@@ -0,0 +1,87 @@
++# Libvirt conversion architecture
++
++This document records two non-obvious design decisions in the libvirt conversion:
++the two-network topology and the bidirectional synced-folder interface.
++
++## Network topology
++
++The original VirtualBox configuration gives each VM a per-VM NAT adapter for
++internet access and a host-only adapter for lab traffic. vagrant-libvirt normally
++connects every project to the shared `vagrant-libvirt` management network, commonly
++`192.168.121.0/24`. That would place this intentionally vulnerable workshop on the
++same layer-2 segment as unrelated Vagrant/libvirt guests.
++
++The conversion creates two lab-specific networks instead:
++
++| Adapter | Network | Mode | Purpose |
++| --- | --- | --- | --- |
++| 1 | `k8s-workshop-mgmt` | NAT + DHCP | SSH, provisioning, DNS, internet |
++| 2 | `k8s-workshop` | isolated, static | Kubernetes, registry, C2, host access |
++
++Adapter 1 defaults to `192.168.157.0/24`. It remains NAT-enabled, so all four VMs
++retain outbound internet access. The network is shared by the four lab VMs but is
++not the default management segment used by unrelated vagrant-libvirt projects.
++This is closer to VirtualBox isolation, although it does not reproduce
++VirtualBox's separate NAT engine for each VM.
++
++Adapter 2 defaults to `192.168.56.0/24` and has no libvirt forwarding or DHCP.
++The host-side bridge still permits host-to-guest and guest-to-guest communication.
++Kubernetes node IPs, Calico autodetection, registry certificates, and Poseidon
++callbacks are explicitly pinned to this adapter so a valid management address is
++never selected accidentally.
++
++The ranges are runtime inputs:
++
++```text
++K8S_LAB_MGMT_NETWORK=192.168.157.0/24
++K8S_LAB_PRIVATE_NETWORK=192.168.56.0/24
++```
++
++Before libvirt creates a VM, the host preflight validates both values, inspects all
++defined libvirt networks and active IPv4 routes, and rejects overlaps. An existing
++network is reused only when its name, CIDR, forwarding, and DHCP settings match.
++The check never edits or deletes an existing network and never silently chooses a
++new range. The error identifies the conflict and shows an environment override.
++
++No runtime check can predict a VPN or route that is activated later. If the host's
++networking changes, halt the lab and rerun the preflight with appropriate overrides.
++
++## Synced-folder contract
++
++`/vagrant` is not merely a source-code mount. It is the state channel between VMs:
++
++- the control plane writes `kubeadm-init.out`, `admin.conf`, and registry keys;
++- workers read the join command, kubeconfig, and registry certificate;
++- the teamserver and lab exercises exchange generated payload and kubeconfig data.
++
++Rsync cannot implement this contract because it synchronizes host to guest only.
++Leaving the Vagrant folder type unspecified is also unsafe: Vagrant chooses a usable
++backend from installed plugins, and rsync can win on a host without NFS.
++
++The supported interface is:
++
++```text
++K8S_LAB_SYNCED_FOLDER=auto
++K8S_LAB_SYNCED_FOLDER=9p
++K8S_LAB_SYNCED_FOLDER=virtiofs
++K8S_LAB_SYNCED_FOLDER=nfs
++```
++
++`auto` considers only bidirectional backends. It selects virtiofs when a
++`virtiofsd` executable is available, otherwise an already-active NFS service, and
++otherwise 9p. NFS readiness is checked without assuming systemd: the host must
++provide `exportfs` and accept local TCP connections on the NFS port. The selected
++backend is printed by the libvirt preflight. An explicit but unavailable backend
++fails there rather than changing semantics silently; VirtualBox and VMware can
++still load the Vagrantfile without satisfying libvirt-only host requirements.
++
++| Backend | Advantages | Costs |
++| --- | --- | --- |
++| virtiofs | fastest; no NFS export | separate daemon; shared-memory backing; passthrough ownership can create root-owned host files |
++| NFSv4 | good performance; host-user ownership mapping | host service and export privileges required |
++| 9p | no host daemon; squash ownership available | slower and more sensitive to permission behaviour |
++
++Virtiofs uses `memfd` shared memory backing. NFS uses version 4 with UDP disabled.
++9p uses squash semantics. Generated host-side file ownership must still be checked
++after the first provisioning run because host security policies and libvirt service
++users vary between distributions.
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..9addc60
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,132 @@
++# Kubernetes workshop: libvirt/KVM support
++
++This tree is the SpecterOps Kubernetes workshop with an additive libvirt/KVM
++provider. The existing VirtualBox and VMware Desktop configuration remains
++available.
++
++Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing the network or synced
++folder configuration. The lab contains intentionally vulnerable services and a
++live Mythic C2 environment, so its isolation choices are deliberate.
++
++## Requirements
++
++- Vagrant 2.4 or newer
++- the `vagrant-libvirt` plugin
++- a working system libvirt/QEMU-KVM installation
++- sufficient capacity for four Ubuntu VMs (8 vCPUs and 16 GiB RAM in total)
++- one of the bidirectional synced-folder backends described below
++
++The default synced-folder setting is `auto`. It prefers virtiofs when
++`virtiofsd` is available, then an already-running NFS service, and finally 9p.
++It never selects rsync because the VMs pass generated cluster state through
++`/vagrant` in both directions.
++
++For libvirt, the Vagrantfile pins `bento/ubuntu-24.04` to `202508.03.0`, a
++release confirmed to publish a libvirt variant. The existing VirtualBox and
++VMware Desktop providers retain the upstream box-resolution behaviour. Override
++the libvirt pin with `K8S_LAB_BOX_VERSION` only after confirming the replacement
++publishes a libvirt variant.
++
++## Start the lab
++
++Validate configuration before creating anything:
++
++```sh
++vagrant validate
++```
++
++Then start the complete lab:
++
++```sh
++vagrant up --no-parallel --provider=libvirt
++```
++
++The Vagrantfile also disables parallel startup automatically. The explicit flag
++documents the requirement: workers and the teamserver consume artefacts written
++by the control plane.
++
++## Preserved lab topology
++
++The functional topology shown in the course diagram is preserved:
++
++| Diagram element | Libvirt conversion |
++| --- | --- |
++| Teamserver | `192.168.56.10`, DNS `teamserver` |
++| Control plane | `192.168.56.20`, API server on TCP 6443 |
++| Worker 1 | `192.168.56.30` |
++| Worker 2 | `192.168.56.31` |
++| Mythic UI | TCP 7443 |
++| Callback port | TCP 8081 |
++| TLS registry | TCP 5000, trusted by the cluster nodes |
++| Mythic callbacks | Developer and noaccess callbacks retained |
++| Host access | Vagrant forwards ports 7443 and 8081 to the teamserver |
++| Private lab traffic | Remains on the isolated `192.168.56.0/24` network |
++| Internet access | Retained through adapter 1 |
++| Hostname resolution | Retained across all four VMs |
++| Code-server and lab manifests | Unchanged from upstream |
++
++There is one deliberate implementation difference:
++
++- VirtualBox gives each VM an independent NAT engine on adapter 1.
++- Libvirt connects all four VMs to the dedicated `k8s-workshop-mgmt` NAT
++  network, normally `192.168.157.0/24`.
++
++The libvirt VMs can therefore communicate through adapter 1, whereas
++VirtualBox's separate NAT adapters do not provide that path. Kubernetes, Calico,
++Mythic callbacks, the registry and lab hostname resolution are explicitly pinned
++to adapter 2, so the lab topology remains unchanged.
++
++Mythic is available directly at `https://192.168.56.10:7443`. Forwarded host
++ports 7443 and 8081 remain conveniences and may be auto-corrected if occupied.
++
++## Host-specific overrides
++
++If the preflight reports an overlapping route or libvirt network, select unused
++private `/24` ranges:
++
++```sh
++K8S_LAB_MGMT_NETWORK=172.28.240.0/24 \
++K8S_LAB_PRIVATE_NETWORK=192.168.77.0/24 \
++vagrant up --no-parallel --provider=libvirt
++```
++
++Keep the same values for every later Vagrant command against that environment.
++The node host numbers remain `.10`, `.20`, `.30`, and `.31`.
++
++Select a synced-folder backend explicitly when required:
++
++```sh
++K8S_LAB_SYNCED_FOLDER=9p vagrant up --provider=libvirt
++K8S_LAB_SYNCED_FOLDER=virtiofs vagrant up --provider=libvirt
++K8S_LAB_SYNCED_FOLDER=nfs vagrant up --provider=libvirt
++```
++
++Virtiofs requires a recent libvirt/QEMU stack and a separately installed
++`virtiofsd`. NFS is configured as NFSv4 over TCP and requires an operational host
++NFS service plus the `exportfs` command. Backend discovery does not assume
++systemd: NFS is considered active when its local TCP service accepts connections
++on port 2049. Explicit backend availability is checked by the libvirt preflight,
++so loading this Vagrantfile for VirtualBox or VMware does not require libvirt host
++tools. 9p needs no host daemon but is slower.
++
++## Container registry rate limits
++
++The upstream provisioning scripts anonymously pre-pull the Calico and Tigera
++container images from Docker Hub inside each Kubernetes VM. Docker Hub can return
++HTTP 429 when its anonymous pull quota is exhausted; this is an in-guest
++containerd image pull, not use of Docker as the Vagrant provider.
++
++If this happens, wait for the quota to reset or configure authenticated/mirrored
++Docker Hub access for containerd inside the guests, then reprovision the failed
++machine. A Docker login on the host alone does not authenticate containerd inside
++the VMs. Pre-loading the required images into the `k8s.io` containerd namespace is
++also sufficient before reprovisioning.
++
++## Teardown
++
++```sh
++vagrant destroy -f
++```
++
++Generated credentials and state are ignored by Git. Review their paths before
++removing them; do not use a broad recursive cleanup command in the project root.
+diff --git a/Vagrantfile b/Vagrantfile
+index 091abd6..2b9e2ed 100644
+--- a/Vagrantfile
++++ b/Vagrantfile
+@@ -1,6 +1,8 @@
+ # -*- mode: ruby -*-
+ # vi: set ft=ruby :
+ 
++require_relative "vagrant-support/libvirt"
++
+ # Kubernetes Workshop Vagrant Configuration
+ # This Vagrantfile creates a Kubernetes cluster environment for training
+ # Windows-compatible: Uses shell provisioning for K8s nodes, ansible_local for teamserver
+@@ -27,6 +29,10 @@ VBOX_GUI = false
+ CONTROL_PLANE_COUNT = 1
+ WORKER_COUNT = 2
+ 
++# Provisioning writes shared state that later machines consume. VirtualBox runs
++# these machines serially, while vagrant-libvirt supports parallel startup.
++ENV["VAGRANT_NO_PARALLEL"] = "yes"
++
+ # Kubernetes configuration
+ K8S_VERSION = "1.35.1-1.1"
+ POD_CIDR = "10.244.0.0/16"
+@@ -39,11 +45,26 @@ WORKER_MEMORY = 2048
+ TEAMSERVER_CPUS = 4
+ TEAMSERVER_MEMORY = 8192
+ 
+-# Network configuration
+-NETWORK_PREFIX = "192.168.56"
+-TEAMSERVER_IP = "#{NETWORK_PREFIX}.10"
++# Network configuration. Both ranges are configurable for hosts where the
++# defaults overlap an existing libvirt network, interface, route, or VPN.
++MANAGEMENT_NETWORK = K8sWorkshop.parse_private_slash24!(
++  ENV.fetch("K8S_LAB_MGMT_NETWORK", "192.168.157.0/24"),
++  "K8S_LAB_MGMT_NETWORK"
++)
++LAB_NETWORK = K8sWorkshop.parse_private_slash24!(
++  ENV.fetch("K8S_LAB_PRIVATE_NETWORK", "192.168.56.0/24"),
++  "K8S_LAB_PRIVATE_NETWORK"
++)
++if K8sWorkshop.overlap?(MANAGEMENT_NETWORK, LAB_NETWORK)
++  raise "K8S_LAB_MGMT_NETWORK and K8S_LAB_PRIVATE_NETWORK must not overlap"
++end
++
++TEAMSERVER_IP = K8sWorkshop.host_address(LAB_NETWORK, 10)
+ CONTROL_PLANE_IP_BASE = 20
+ WORKER_IP_BASE = 30
++SYNCED_FOLDER_TYPE = K8sWorkshop::SyncedFolder.resolve(
++  ENV.fetch("K8S_LAB_SYNCED_FOLDER", "auto").downcase
++)
+ 
+ $host_script = <<-SCRIPT
+ set -euo pipefail
+@@ -58,8 +79,8 @@ sed -i '/# Kubernetes Workshop VMs/,/# End Kubernetes Workshop VMs/d' "${HOSTS_F
+ cat >> "${HOSTS_FILE}" <<EOF
+ # Kubernetes Workshop VMs
+ #{TEAMSERVER_IP} teamserver k8s-workshop-teamserver
+-#{(1..CONTROL_PLANE_COUNT).map { |i| "#{NETWORK_PREFIX}.#{CONTROL_PLANE_IP_BASE + i - 1} control-plane-#{i} k8s-control-plane-#{i}" }.join("\n")}
+-#{(1..WORKER_COUNT).map { |i| "#{NETWORK_PREFIX}.#{WORKER_IP_BASE + i - 1} worker-#{i} k8s-worker-#{i}" }.join("\n")}
++#{(1..CONTROL_PLANE_COUNT).map { |i| "#{K8sWorkshop.host_address(LAB_NETWORK, CONTROL_PLANE_IP_BASE + i - 1)} control-plane-#{i} k8s-control-plane-#{i}" }.join("\n")}
++#{(1..WORKER_COUNT).map { |i| "#{K8sWorkshop.host_address(LAB_NETWORK, WORKER_IP_BASE + i - 1)} worker-#{i} k8s-worker-#{i}" }.join("\n")}
+ # End Kubernetes Workshop VMs
+ EOF
+ 
+@@ -70,13 +91,48 @@ SCRIPT
+ 
+ Vagrant.configure("2") do |config|
+   config.vm.box = "bento/ubuntu-24.04"
+-  ## Version used to build out lab
+-  # config.vm.box_version = "202510.26.0"
+   config.vm.boot_timeout = 600
+ 
+   # Keep /vagrant synced folder enabled for script access
+   config.vm.synced_folder ".", "/vagrant"
+ 
++  # Libvirt adapter 1 is a lab-specific NAT management network. Adapter 2 is
++  # configured per machine below as an isolated lab network.
++  config.vm.provider "libvirt" do |lv, override|
++    # Pin only the added provider; preserve upstream box resolution for the
++    # existing VirtualBox and VMware Desktop providers.
++    override.vm.box_version = ENV.fetch("K8S_LAB_BOX_VERSION", "202508.03.0")
++    lv.default_prefix = "k8s-workshop"
++    lv.driver = "kvm"
++    lv.cpu_mode = "host-passthrough"
++    lv.management_network_name = K8sWorkshop::MGMT_NETWORK_NAME
++    lv.management_network_address = K8sWorkshop.cidr_string(MANAGEMENT_NETWORK)
++    lv.management_network_mode = "nat"
++
++    synced_folder_options = { type: SYNCED_FOLDER_TYPE }
++    case SYNCED_FOLDER_TYPE
++    when "virtiofs"
++      lv.memorybacking :source, type: "memfd"
++      lv.memorybacking :access, mode: "shared"
++    when "nfs"
++      synced_folder_options.merge!(nfs_version: 4, nfs_udp: false)
++    when "9p"
++      synced_folder_options.merge!(accessmode: "squash")
++    end
++    override.vm.synced_folder ".", "/vagrant", **synced_folder_options
++
++    override.trigger.before :up do |trigger|
++      trigger.name = "Validate libvirt lab networks"
++      trigger.ruby do |_env, _machine|
++        K8sWorkshop::LibvirtPreflight.run!(
++          management_cidr: MANAGEMENT_NETWORK,
++          lab_cidr: LAB_NETWORK,
++          synced_folder_type: SYNCED_FOLDER_TYPE
++        )
++      end
++    end
++  end
++
+   # Global provisioning: setup hosts file on all VMs
+   config.vm.provision "shell", run: "always", inline: $host_script
+ 
+@@ -84,8 +140,12 @@ Vagrant.configure("2") do |config|
+   (1..CONTROL_PLANE_COUNT).each do |i|
+     config.vm.define "control-plane-#{i}" do |control|
+       control.vm.hostname = "k8s-control-plane-#{i}"
+-      node_ip = "#{NETWORK_PREFIX}.#{CONTROL_PLANE_IP_BASE + i - 1}"
+-      control.vm.network "private_network", ip: node_ip
++      node_ip = K8sWorkshop.host_address(LAB_NETWORK, CONTROL_PLANE_IP_BASE + i - 1)
++      control.vm.network "private_network",
++        ip: node_ip,
++        libvirt__network_name: K8sWorkshop::LAB_NETWORK_NAME,
++        libvirt__dhcp_enabled: false,
++        libvirt__forward_mode: "none"
+ 
+       control.vm.provider "virtualbox" do |vb|
+         vb.name = "k8s-workshop-control-plane-#{i}"
+@@ -102,6 +162,10 @@ Vagrant.configure("2") do |config|
+         v.vmx["numvcpus"] = CONTROL_PLANE_CPUS
+         v.vmx["memsize"] = CONTROL_PLANE_MEMORY
+       end
++      control.vm.provider "libvirt" do |lv|
++        lv.cpus = CONTROL_PLANE_CPUS
++        lv.memory = CONTROL_PLANE_MEMORY
++      end
+ 
+       # Common Kubernetes setup
+       control.vm.provision "shell",
+@@ -121,7 +185,7 @@ Vagrant.configure("2") do |config|
+       # Control plane specific setup
+       control.vm.provision "shell",
+         path: "vagrant-scripts/control-plane.sh",
+-        args: "#{POD_CIDR} #{node_ip}"
++        args: "#{POD_CIDR} #{node_ip} #{K8sWorkshop.cidr_string(LAB_NETWORK)}"
+ 
+       # Create namespaces before provisioning resources that depend on them
+       control.vm.provision "shell",
+@@ -148,8 +212,12 @@ Vagrant.configure("2") do |config|
+   (1..WORKER_COUNT).each do |i|
+     config.vm.define "worker-#{i}" do |worker|
+       worker.vm.hostname = "k8s-worker-#{i}"
+-      node_ip = "#{NETWORK_PREFIX}.#{WORKER_IP_BASE + i - 1}"
+-      worker.vm.network "private_network", ip: node_ip
++      node_ip = K8sWorkshop.host_address(LAB_NETWORK, WORKER_IP_BASE + i - 1)
++      worker.vm.network "private_network",
++        ip: node_ip,
++        libvirt__network_name: K8sWorkshop::LAB_NETWORK_NAME,
++        libvirt__dhcp_enabled: false,
++        libvirt__forward_mode: "none"
+ 
+       worker.vm.provider "virtualbox" do |vb|
+         vb.name = "k8s-workshop-worker-#{i}"
+@@ -166,6 +234,10 @@ Vagrant.configure("2") do |config|
+         v.vmx["numvcpus"] = WORKER_CPUS
+         v.vmx["memsize"] = WORKER_MEMORY
+       end
++      worker.vm.provider "libvirt" do |lv|
++        lv.cpus = WORKER_CPUS
++        lv.memory = WORKER_MEMORY
++      end
+ 
+       # Common Kubernetes setup
+       worker.vm.provision "shell",
+@@ -192,7 +264,11 @@ Vagrant.configure("2") do |config|
+   # Teamserver VM (Mythic C2 server)
+   config.vm.define "teamserver", primary: true do |teamserver|
+     teamserver.vm.hostname = "k8s-workshop-teamserver"
+-    teamserver.vm.network "private_network", ip: TEAMSERVER_IP
++    teamserver.vm.network "private_network",
++      ip: TEAMSERVER_IP,
++      libvirt__network_name: K8sWorkshop::LAB_NETWORK_NAME,
++      libvirt__dhcp_enabled: false,
++      libvirt__forward_mode: "none"
+     teamserver.vm.network "forwarded_port", guest: 7443, host: 7443, auto_correct: true
+     teamserver.vm.network "forwarded_port", guest: 8081, host: 8081, auto_correct: true
+ 
+@@ -211,6 +287,10 @@ Vagrant.configure("2") do |config|
+       v.vmx["numvcpus"] = TEAMSERVER_CPUS
+       v.vmx["memsize"] = TEAMSERVER_MEMORY
+     end
++    teamserver.vm.provider "libvirt" do |lv|
++      lv.cpus = TEAMSERVER_CPUS
++      lv.memory = TEAMSERVER_MEMORY
++    end
+ 
+     # Install registry certificate (generated by control plane)
+     teamserver.vm.provision "shell",
+@@ -226,6 +306,7 @@ Vagrant.configure("2") do |config|
+       ansible.galaxy_role_file = "requirements.yaml"
+       ansible.galaxy_command = "ansible-galaxy collection install -r %{role_file} --force && ansible-galaxy role install -r %{role_file} --force"
+       ansible.version = "latest"
++      ansible.extra_vars = { mythic_ip: TEAMSERVER_IP }
+     end
+ 
+     # Worker node specific setup
+diff --git a/playbooks/roles/k8s-wksp-teamserver/defaults/main.yml b/playbooks/roles/k8s-wksp-teamserver/defaults/main.yml
+index b059975..f212342 100644
+--- a/playbooks/roles/k8s-wksp-teamserver/defaults/main.yml
++++ b/playbooks/roles/k8s-wksp-teamserver/defaults/main.yml
+@@ -4,8 +4,6 @@ mythic_dir: "/opt/mythic"
+ mythic_cli: "{{ mythic_dir }}/mythic-cli"
+ api_token_file: "{{ mythic_dir }}/.api_token"
+ shared_file_download_url: "/vagrant/payload_download_url"
+-# this should be the interface that's on the shared private network
+-mythic_ip: '{{ ansible_facts["eth1"]["ipv4"]["address"] }}'
+ 
+ base_users:
+   - developer
+diff --git a/playbooks/roles/k8s-wksp-teamserver/tasks/main.yml b/playbooks/roles/k8s-wksp-teamserver/tasks/main.yml
+index 18c834f..dbe73e2 100644
+--- a/playbooks/roles/k8s-wksp-teamserver/tasks/main.yml
++++ b/playbooks/roles/k8s-wksp-teamserver/tasks/main.yml
+@@ -1,6 +1,15 @@
+ ---
+ # tasks file for k8s-wksp-teamserver
+ 
++- name: Require the Mythic callback address
++  ansible.builtin.assert:
++    that:
++      - mythic_ip is defined
++      - mythic_ip | string | length > 0
++    fail_msg: >-
++      mythic_ip must be supplied explicitly. Vagrant passes the teamserver's
++      isolated lab-network address because it is baked into Poseidon payloads.
++
+ - name: Create users needed to access the k8s cluster
+   ansible.builtin.user:
+     name: "{{ item }}"
+diff --git a/playbooks/roles/k8s-wksp-teamserver/templates/payload.json.j2 b/playbooks/roles/k8s-wksp-teamserver/templates/payload.json.j2
+index 7667564..ebc5e38 100644
+--- a/playbooks/roles/k8s-wksp-teamserver/templates/payload.json.j2
++++ b/playbooks/roles/k8s-wksp-teamserver/templates/payload.json.j2
+@@ -128,7 +128,7 @@
+             "c2_profile": "http",
+             "c2_profile_parameters": {
+                 "AESPSK": "aes256_hmac",
+-                "callback_host": "http://{{ ansible_default_ipv4.address }}",
++                "callback_host": "http://{{ mythic_ip }}",
+                 "callback_interval": "1",
+                 "callback_jitter": "23",
+                 "callback_port": "80",
+@@ -145,4 +145,4 @@
+             }
+         }
+     ]
+-}
+\ No newline at end of file
++}
+diff --git a/vagrant-scripts/control-plane.sh b/vagrant-scripts/control-plane.sh
+index 7f9dff0..16437a5 100644
+--- a/vagrant-scripts/control-plane.sh
++++ b/vagrant-scripts/control-plane.sh
+@@ -20,6 +20,7 @@ set -euo pipefail
+ 
+ POD_CIDR="${1:-10.244.0.0/16}"
+ API_ADV_ADDRESS="${2:-192.168.56.20}"
++NODE_NETWORK_CIDR="${3:-192.168.56.0/24}"
+ 
+ function run_with_retry() {
+   local description="$1"
+@@ -47,6 +48,7 @@ function run_with_retry() {
+ echo "=== Starting control plane setup ==="
+ echo "Pod CIDR: ${POD_CIDR}"
+ echo "API Server Address: ${API_ADV_ADDRESS}"
++echo "Node Network CIDR: ${NODE_NETWORK_CIDR}"
+ 
+ # Pre-pull Kubernetes control-plane images to make transient registry failures
+ # explicit and retryable before kubeadm starts mutating cluster state.
+@@ -105,6 +107,9 @@ metadata:
+   name: default
+ spec:
+   calicoNetwork:
++    nodeAddressAutodetectionV4:
++      cidrs:
++        - ${NODE_NETWORK_CIDR}
+     ipPools:
+     - blockSize: 26
+       cidr: ${POD_CIDR}
+diff --git a/vagrant-scripts/worker.sh b/vagrant-scripts/worker.sh
+index db2e84c..1ec6027 100644
+--- a/vagrant-scripts/worker.sh
++++ b/vagrant-scripts/worker.sh
+@@ -20,6 +20,16 @@ NODE_IP="${1}"
+ echo "=== Starting worker node setup ==="
+ echo "Node IP: ${NODE_IP}"
+ 
++if [[ ! -s /vagrant/kubeadm-init.out ]]; then
++  echo "ERROR: /vagrant/kubeadm-init.out is missing or empty; bring up the control plane before this worker" >&2
++  exit 1
++fi
++
++if [[ ! -s /vagrant/admin.conf ]]; then
++  echo "ERROR: /vagrant/admin.conf is missing or empty; bring up the control plane before this worker" >&2
++  exit 1
++fi
++
+ # Configure kubelet
+ echo "=== Configuring kubelet ==="
+ cat <<EOF > /etc/default/kubelet
+@@ -28,7 +38,12 @@ EOF
+ 
+ # Extract and run the join command
+ echo "=== Joining cluster ==="
+-$(cat /vagrant/kubeadm-init.out | grep -A 2 "kubeadm join" | sed -e 's/^[ \t]*//' | tr '\n' ' ' | sed -e 's/ \\ / /g')
++JOIN_COMMAND="$(grep -A 2 "kubeadm join" /vagrant/kubeadm-init.out | sed -e 's/^[ \t]*//' | tr '\n' ' ' | sed -e 's/ \\ / /g')"
++if [[ -z "${JOIN_COMMAND}" ]]; then
++  echo "ERROR: no kubeadm join command was found in /vagrant/kubeadm-init.out" >&2
++  exit 1
++fi
++eval "${JOIN_COMMAND}"
+ 
+ systemctl restart kubelet
+ 
+diff --git a/vagrant-support/libvirt.rb b/vagrant-support/libvirt.rb
+new file mode 100644
+index 0000000..74be0c0
+--- /dev/null
++++ b/vagrant-support/libvirt.rb
+@@ -0,0 +1,275 @@
++# frozen_string_literal: true
++
++require "ipaddr"
++require "open3"
++require "rexml/document"
++require "socket"
++
++module K8sWorkshop
++  MGMT_NETWORK_NAME = "k8s-workshop-mgmt"
++  LAB_NETWORK_NAME = "k8s-workshop"
++  SUPPORTED_SYNC_TYPES = %w[auto 9p virtiofs nfs].freeze
++  RFC1918_NETWORKS = [
++    IPAddr.new("10.0.0.0/8"),
++    IPAddr.new("172.16.0.0/12"),
++    IPAddr.new("192.168.0.0/16")
++  ].freeze
++
++  Network = Struct.new(:name, :cidr, :forward_mode, :dhcp, keyword_init: true)
++
++  module_function
++
++  def parse_private_slash24!(value, variable_name)
++    cidr = IPAddr.new(value)
++    prefix = value.to_s.split("/", 2)[1]
++    unless cidr.ipv4? && prefix == "24" && RFC1918_NETWORKS.any? { |range| range.include?(cidr.to_range.begin) && range.include?(cidr.to_range.end) }
++      raise ArgumentError, "#{variable_name} must be a private IPv4 /24 CIDR (received #{value.inspect})"
++    end
++
++    canonical = "#{cidr.to_range.begin}/24"
++    unless canonical == value
++      raise ArgumentError, "#{variable_name} must use the network address #{canonical} (received #{value.inspect})"
++    end
++
++    cidr
++  rescue IPAddr::InvalidAddressError
++    raise ArgumentError, "#{variable_name} is not a valid CIDR (received #{value.inspect})"
++  end
++
++  def host_address(network, host_number)
++    raise ArgumentError, "host number must be between 1 and 254" unless (1..254).cover?(host_number)
++
++    IPAddr.new(network.to_i + host_number, Socket::AF_INET).to_s
++  end
++
++  def cidr_string(network)
++    "#{network.to_range.begin}/#{network.prefix}"
++  end
++
++  def overlap?(left, right)
++    left.include?(right.to_range.begin) || right.include?(left.to_range.begin)
++  end
++
++  module SyncedFolder
++    module_function
++
++    def resolve(requested)
++      unless SUPPORTED_SYNC_TYPES.include?(requested)
++        raise ArgumentError,
++              "K8S_LAB_SYNCED_FOLDER must be one of #{SUPPORTED_SYNC_TYPES.join(', ')} (received #{requested.inspect})"
++      end
++
++      return requested unless requested == "auto"
++      return "virtiofs" if virtiofsd_path
++      return "nfs" if nfs_ready?
++
++      "9p"
++    end
++
++    def validate_available!(selected)
++      case selected
++      when "virtiofs"
++        return true if virtiofsd_path
++
++        raise "K8S_LAB_SYNCED_FOLDER=virtiofs requires an executable virtiofsd on the host"
++      when "nfs"
++        return true if nfs_ready?
++
++        raise "K8S_LAB_SYNCED_FOLDER=nfs requires exportfs and an active NFS service on TCP port 2049"
++      when "9p"
++        true
++      else
++        raise ArgumentError, "unsupported resolved synced-folder backend #{selected.inspect}"
++      end
++    end
++
++    def virtiofsd_path
++      candidates = [executable_on_path("virtiofsd")]
++      candidates.concat(%w[/usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd])
++      candidates.compact!
++      candidates.find { |path| File.file?(path) && File.executable?(path) }
++    end
++
++    def nfs_ready?
++      exportfs_path = executable_on_path("exportfs")
++      exportfs_path ||= %w[/usr/sbin/exportfs /sbin/exportfs].find do |path|
++        File.file?(path) && File.executable?(path)
++      end
++      return false unless exportfs_path
++
++      tcp_service_ready?("localhost", 2049)
++    end
++
++    def tcp_service_ready?(host, port)
++      Socket.tcp(host, port, connect_timeout: 1) { |socket| socket.close }
++      true
++    rescue SocketError, SystemCallError
++      false
++    end
++
++    def executable_on_path(name)
++      extensions = [""]
++      if File::ALT_SEPARATOR
++        extensions.concat(ENV.fetch("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(File::PATH_SEPARATOR))
++      end
++
++      ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |directory|
++        next if directory.empty?
++
++        extensions.each do |extension|
++          candidate = File.join(directory, "#{name}#{extension}")
++          return candidate if File.file?(candidate) && File.executable?(candidate)
++        end
++      end
++
++      nil
++    end
++  end
++
++  module LibvirtPreflight
++    module_function
++
++    def run!(management_cidr:, lab_cidr:, synced_folder_type:)
++      K8sWorkshop::SyncedFolder.validate_available!(synced_folder_type)
++      puts "Kubernetes workshop libvirt synced-folder backend: #{synced_folder_type}"
++
++      desired = {
++        MGMT_NETWORK_NAME => Network.new(
++          name: MGMT_NETWORK_NAME,
++          cidr: management_cidr,
++          forward_mode: "nat",
++          dhcp: true
++        ),
++        LAB_NETWORK_NAME => Network.new(
++          name: LAB_NETWORK_NAME,
++          cidr: lab_cidr,
++          forward_mode: "none",
++          dhcp: false
++        )
++      }
++
++      validate_inventory!(desired, libvirt_networks, host_routes)
++      puts "Libvirt network preflight passed: #{K8sWorkshop.cidr_string(management_cidr)} (NAT), " \
++           "#{K8sWorkshop.cidr_string(lab_cidr)} (isolated)"
++    end
++
++    def validate_inventory!(desired, networks, routes)
++      wanted = desired.values
++      if K8sWorkshop.overlap?(wanted[0].cidr, wanted[1].cidr)
++        raise "K8S_LAB_MGMT_NETWORK #{K8sWorkshop.cidr_string(wanted[0].cidr)} overlaps " \
++              "K8S_LAB_PRIVATE_NETWORK #{K8sWorkshop.cidr_string(wanted[1].cidr)}"
++      end
++
++      reusable_cidrs = []
++      networks.each do |existing|
++        matching_name = desired[existing.name]
++        if matching_name
++          validate_named_network!(matching_name, existing)
++          reusable_cidrs << existing.cidr
++          next
++        end
++
++        wanted.each do |requested|
++          next unless K8sWorkshop.overlap?(requested.cidr, existing.cidr)
++
++          raise collision_message(
++            requested,
++            "libvirt network #{existing.name.inspect} at #{K8sWorkshop.cidr_string(existing.cidr)}"
++          )
++        end
++      end
++
++      routes.each do |route|
++        next if reusable_cidrs.any? do |cidr|
++          cidr.include?(route.to_range.begin) && cidr.include?(route.to_range.end)
++        end
++
++        wanted.each do |requested|
++          next unless K8sWorkshop.overlap?(requested.cidr, route)
++
++          raise collision_message(requested, "host route #{K8sWorkshop.cidr_string(route)}")
++        end
++      end
++
++      true
++    end
++
++    def validate_named_network!(requested, existing)
++      problems = []
++      same_cidr = existing.cidr.to_i == requested.cidr.to_i &&
++        existing.cidr.prefix == requested.cidr.prefix
++      unless same_cidr
++        problems << "CIDR #{K8sWorkshop.cidr_string(existing.cidr)} instead of #{K8sWorkshop.cidr_string(requested.cidr)}"
++      end
++      problems << "forward mode #{existing.forward_mode.inspect} instead of #{requested.forward_mode.inspect}" unless existing.forward_mode == requested.forward_mode
++      problems << "DHCP #{existing.dhcp ? 'enabled' : 'disabled'} instead of #{requested.dhcp ? 'enabled' : 'disabled'}" unless existing.dhcp == requested.dhcp
++      return if problems.empty?
++
++      raise "libvirt network #{requested.name.inspect} already exists with incompatible settings: #{problems.join('; ')}"
++    end
++
++    def collision_message(requested, conflict)
++      variable = requested.name == MGMT_NETWORK_NAME ? "K8S_LAB_MGMT_NETWORK" : "K8S_LAB_PRIVATE_NETWORK"
++      example = requested.name == MGMT_NETWORK_NAME ? "172.28.240.0/24" : "192.168.77.0/24"
++      "requested #{requested.name} network #{K8sWorkshop.cidr_string(requested.cidr)} overlaps #{conflict}. " \
++        "Choose another unused private /24, for example: #{variable}=#{example} vagrant up --provider=libvirt"
++    end
++
++    def libvirt_networks
++      stdout, stderr, status = Open3.capture3("virsh", "net-list", "--all", "--name")
++      raise "unable to query libvirt networks: #{stderr.strip}" unless status.success?
++
++      stdout.lines.filter_map do |line|
++        name = line.strip
++        next if name.empty?
++
++        xml, xml_stderr, xml_status = Open3.capture3("virsh", "net-dumpxml", name)
++        raise "unable to inspect libvirt network #{name.inspect}: #{xml_stderr.strip}" unless xml_status.success?
++
++        parse_network_xml(name, xml)
++      end.compact
++    rescue Errno::ENOENT
++      raise "virsh is required for the libvirt network preflight"
++    end
++
++    def parse_network_xml(name, xml)
++      document = REXML::Document.new(xml)
++      ip_element = REXML::XPath.first(document, "/network/ip[@address]")
++      return nil unless ip_element
++
++      address = ip_element.attributes["address"]
++      prefix = ip_element.attributes["prefix"]
++      mask = ip_element.attributes["netmask"]
++      cidr = IPAddr.new("#{address}/#{prefix || mask}")
++      cidr = IPAddr.new("#{cidr.to_range.begin}/#{prefix || mask}")
++      forward = REXML::XPath.first(document, "/network/forward")
++      dhcp = !REXML::XPath.first(document, "/network/ip/dhcp").nil?
++
++      Network.new(
++        name: name,
++        cidr: cidr,
++        forward_mode: forward ? forward.attributes["mode"].to_s : "none",
++        dhcp: dhcp
++      )
++    rescue REXML::ParseException, IPAddr::InvalidAddressError => e
++      raise "unable to parse libvirt network #{name.inspect}: #{e.message}"
++    end
++
++    def host_routes
++      stdout, stderr, status = Open3.capture3("ip", "-o", "-4", "route", "show", "table", "all")
++      raise "unable to query host routes: #{stderr.strip}" unless status.success?
++
++      stdout.lines.filter_map do |line|
++        token = line.split.find { |part| part.match?(/\A\d+\.\d+\.\d+\.\d+(?:\/\d+)?\z/) }
++        next unless token
++
++        token += "/32" unless token.include?("/")
++        IPAddr.new(token)
++      rescue IPAddr::InvalidAddressError
++        nil
++      end.uniq
++    rescue Errno::ENOENT
++      raise "the ip command is required for the libvirt network preflight"
++    end
++  end
++end
