@@ -1,7 +1,7 @@
 # Libvirt conversion architecture
 
-This document records two non-obvious design decisions in the libvirt conversion:
-the two-network topology and the bidirectional synced-folder interface.
+This document explains the libvirt conversion's two-network topology, forwarded
+host-port behaviour and bidirectional synced-folder interface.
 
 ## Network topology
 
